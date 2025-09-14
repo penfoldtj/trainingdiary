@@ -1,0 +1,8 @@
+streamlit>=1.32
+plotly>=5.20
+requests
+pandas
+beautifulsoup4
+lxml
+setuptools>=65
+wheel
