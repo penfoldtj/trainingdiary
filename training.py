@@ -4,23 +4,27 @@ import plotly.express as px
 import sqlite3
 from datetime import datetime, date, timedelta
 
-# -----------------------------
-# Config
-# -----------------------------
+# =============================
+# App Config
+# =============================
 st.set_page_config(page_title="Training Diary", layout="wide")
 
-DB_PATH = "training_diary.db"  # <-- your persistent file
+DB_PATH = "training_diary.db"  # persistent local file
+ATHLETES = ["Noah Penfold", "Ada Penfold"]  # toggle options
 
-# -----------------------------
+# Choose which athlete's diary you're viewing/editing
+selected_athlete = st.sidebar.radio("Athlete", ATHLETES, index=0)
+
+# =============================
 # Utilities
-# -----------------------------
+# =============================
 def parse_duration_to_seconds(s: str) -> int:
-    """Accept 'HH:MM:SS' or 'MM:SS' or minutes as number-like; returns total seconds."""
+    """Accept 'HH:MM:SS' or 'MM:SS' or a number meaning minutes; returns total seconds."""
     if s is None or str(s).strip() == "":
         return 0
     s = str(s).strip()
     if s.isdigit():
-        return int(float(s) * 60)  # treat plain number as minutes
+        return int(float(s) * 60)  # plain number -> minutes
     parts = s.split(":")
     try:
         if len(parts) == 3:
@@ -39,6 +43,7 @@ def format_seconds(sec: int) -> str:
     """Format seconds as HH:MM:SS."""
     if sec is None:
         return "00:00:00"
+    sec = int(sec)
     h = sec // 3600
     m = (sec % 3600) // 60
     s = sec % 60
@@ -53,36 +58,48 @@ def calc_pace(duration_s: int, distance_km: float) -> str:
         return f"{m:02d}:{s:02d}/km"
     return "-"
 
-# -----------------------------
+# =============================
 # Database Helpers
-# -----------------------------
+# =============================
 @st.cache_resource
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # Base table (if first run)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS entries (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           session_date TEXT NOT NULL,      -- YYYY-MM-DD
           sport TEXT NOT NULL,             -- e.g., Run, Bike, Swim, S&C
           session_type TEXT,               -- e.g., Easy, Intervals, Long, Race, Tempo
-          distance_km REAL,                -- km (can be 0/NULL for non-distance sessions)
-          duration_s INTEGER,              -- total seconds
-          rpe INTEGER,                     -- 1..10
+          distance_km REAL,                -- km (nullable)
+          duration_s INTEGER,              -- total seconds (nullable)
+          rpe INTEGER,                     -- 1..10 (nullable)
           notes TEXT
         )
     """)
     conn.commit()
+
+    # Migration: ensure 'athlete' column exists
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(entries)").fetchall()]
+    if "athlete" not in cols:
+        conn.execute("ALTER TABLE entries ADD COLUMN athlete TEXT")
+        # Backfill existing rows to first athlete so nothing breaks
+        conn.execute("UPDATE entries SET athlete = ?", (ATHLETES[0],))
+        conn.commit()
     return conn
 
-def insert_entry(conn, session_date, sport, session_type, distance_km, duration_s, rpe, notes):
+def insert_entry(conn, athlete, session_date, sport, session_type, distance_km, duration_s, rpe, notes):
     conn.execute(
-        "INSERT INTO entries (session_date, sport, session_type, distance_km, duration_s, rpe, notes) VALUES (?,?,?,?,?,?,?)",
-        (session_date, sport, session_type, distance_km, duration_s, rpe, notes),
+        "INSERT INTO entries (athlete, session_date, sport, session_type, distance_km, duration_s, rpe, notes) VALUES (?,?,?,?,?,?,?,?)",
+        (athlete, session_date, sport, session_type, distance_km, duration_s, rpe, notes),
     )
     conn.commit()
 
-def load_entries(conn) -> pd.DataFrame:
-    df = pd.read_sql_query("SELECT * FROM entries ORDER BY session_date DESC, id DESC", conn)
+def load_entries(conn, athlete) -> pd.DataFrame:
+    df = pd.read_sql_query(
+        "SELECT * FROM entries WHERE athlete = ? ORDER BY session_date DESC, id DESC",
+        conn, params=(athlete,)
+    )
     if not df.empty:
         df["session_date"] = pd.to_datetime(df["session_date"]).dt.date
     return df
@@ -90,7 +107,7 @@ def load_entries(conn) -> pd.DataFrame:
 def update_entry(conn, row):
     conn.execute(
         """UPDATE entries SET session_date=?, sport=?, session_type=?, distance_km=?, duration_s=?, rpe=?, notes=?
-           WHERE id=?""",
+           WHERE id=? AND athlete=?""",
         (
             row["session_date"].strftime("%Y-%m-%d") if isinstance(row["session_date"], date) else str(row["session_date"]),
             row["sport"],
@@ -100,20 +117,21 @@ def update_entry(conn, row):
             int(row["rpe"]) if pd.notna(row["rpe"]) else None,
             row.get("notes"),
             int(row["id"]),
+            row["athlete"],
         ),
     )
     conn.commit()
 
-def delete_entries(conn, ids):
+def delete_entries(conn, ids, athlete):
     if not ids:
         return
     q_marks = ",".join("?" for _ in ids)
-    conn.execute(f"DELETE FROM entries WHERE id IN ({q_marks})", ids)
+    conn.execute(f"DELETE FROM entries WHERE athlete = ? AND id IN ({q_marks})", (athlete, *ids))
     conn.commit()
 
-# -----------------------------
+# =============================
 # Sidebar: Add Session
-# -----------------------------
+# =============================
 st.sidebar.header("Add Training Session")
 
 with st.sidebar.form("add_form", clear_on_submit=True):
@@ -127,7 +145,7 @@ with st.sidebar.form("add_form", clear_on_submit=True):
         duration_str = st.text_input("Duration (HH:MM:SS or MM:SS or minutes)", value="00:45:00")
     rpe = st.slider("RPE (1 easy - 10 max)", 1, 10, 6)
     notes = st.text_area("Notes", placeholder="Optional details…")
-    submitted = st.form_submit_button("Add Session", type="primary")
+    submitted = st.form_submit_button(f"Add Session for {selected_athlete}", type="primary")
 
 conn = get_conn()
 
@@ -135,6 +153,7 @@ if submitted:
     duration_s = parse_duration_to_seconds(duration_str)
     insert_entry(
         conn,
+        athlete=selected_athlete,
         session_date=d.strftime("%Y-%m-%d"),
         sport=sport,
         session_type=session_type,
@@ -143,12 +162,12 @@ if submitted:
         rpe=rpe,
         notes=notes.strip() if notes else None,
     )
-    st.sidebar.success("Session added ✔️")
+    st.sidebar.success(f"Session added for {selected_athlete} ✔️")
 
-# -----------------------------
+# =============================
 # Load & Filters
-# -----------------------------
-df = load_entries(conn)
+# =============================
+df = load_entries(conn, selected_athlete)
 
 st.title("🏃‍♀️ Training Diary")
 
@@ -190,9 +209,9 @@ if not filtered.empty:
     )
     filtered = filtered.sort_values(["session_date", "id"], ascending=[False, False])
 
-# -----------------------------
+# =============================
 # KPI Bar
-# -----------------------------
+# =============================
 def secs_sum(series):
     s = int(series.dropna().sum()) if not series.empty else 0
     return format_seconds(s)
@@ -213,9 +232,9 @@ else:
     colC.metric("Time", time_fmt)
     colD.metric("Avg RPE", f"{rpe_avg:.1f}" if rpe_avg is not None else "-")
 
-# -----------------------------
+# =============================
 # Charts
-# -----------------------------
+# =============================
 if not filtered.empty:
     # Weekly totals (distance & time)
     chart_df = filtered.copy()
@@ -244,15 +263,15 @@ if not filtered.empty:
                           hover_data=["session_type", "notes"], title="RPE Over Time", trendline="lowess")
         st.plotly_chart(fig3, use_container_width=True)
 
-# -----------------------------
+# =============================
 # Editor (inline edit & delete)
-# -----------------------------
-st.subheader("Log")
+# =============================
+st.subheader(f"Log — {selected_athlete}")
 
 if filtered.empty:
     st.info("No sessions yet. Add your first one from the sidebar!")
 else:
-    # Show a light-weight table with editable fields (not all columns editable)
+    # Show an editable grid (we edit a friendly 'Duration' string, map back to seconds on save)
     show_cols = ["id", "session_date", "sport", "session_type", "distance_km", "Duration", "rpe", "Pace", "notes"]
     edited = st.data_editor(
         filtered[show_cols],
@@ -274,21 +293,19 @@ else:
 
     # Save edits
     if st.button("Save Edits", type="primary"):
-        # Merge edited values back into canonical columns and update DB
-        # Map 'Duration' back to 'duration_s'
-        merged = edited.merge(filtered[["id"] + [c for c in filtered.columns if c not in edited.columns]], on="id", how="left")
-        # Rebuild duration_s and date format
+        # Reattach hidden columns needed for update (athlete, duration_s)
+        base = filtered[["id", "athlete", "duration_s"]].copy()
+        merged = edited.merge(base, on="id", how="left")
         for _, row in merged.iterrows():
-            # Convert Duration string to seconds
             dur_s = parse_duration_to_seconds(row.get("Duration", ""))
-            # Build a row dict compatible with update_entry
             upd = {
-                "id": row["id"],
+                "id": int(row["id"]),
+                "athlete": selected_athlete,
                 "session_date": row["session_date"],
                 "sport": row["sport"],
                 "session_type": row.get("session_type"),
                 "distance_km": row.get("distance_km"),
-                "duration_s": dur_s,
+                "duration_s": int(dur_s) if dur_s else None,
                 "rpe": row.get("rpe"),
                 "notes": row.get("notes"),
             }
@@ -300,26 +317,30 @@ else:
     with st.expander("Delete sessions…"):
         ids_to_delete = st.multiselect("Select entry IDs to delete", options=list(edited["id"]))
         if st.button("Delete Selected", type="secondary", disabled=len(ids_to_delete) == 0):
-            delete_entries(conn, ids_to_delete)
+            delete_entries(conn, ids_to_delete, selected_athlete)
             st.warning(f"Deleted {len(ids_to_delete)} session(s).")
             st.rerun()
 
-# -----------------------------
+# =============================
 # Import / Export
-# -----------------------------
+# =============================
 st.subheader("Import / Export")
 
 c1, c2 = st.columns(2)
 with c1:
     if st.button("Export CSV"):
-        all_df = load_entries(conn)
+        all_df = load_entries(conn, selected_athlete)
         if not all_df.empty:
-            # Convert duration to HH:MM:SS for a human-friendly CSV
             out = all_df.copy()
             out["Duration"] = out["duration_s"].apply(lambda x: format_seconds(int(x)) if pd.notna(x) else "")
             out["session_date"] = out["session_date"].astype(str)
-            cols = ["id", "session_date", "sport", "session_type", "distance_km", "Duration", "rpe", "notes"]
-            st.download_button("Download training_diary.csv", out[cols].to_csv(index=False), file_name="training_diary.csv", mime="text/csv")
+            cols = ["id", "athlete", "session_date", "sport", "session_type", "distance_km", "Duration", "rpe", "notes"]
+            st.download_button(
+                f"Download {selected_athlete.replace(' ','_').lower()}_training_diary.csv",
+                out[cols].to_csv(index=False),
+                file_name=f"{selected_athlete.replace(' ','_').lower()}_training_diary.csv",
+                mime="text/csv",
+            )
         else:
             st.info("Nothing to export yet.")
 
@@ -328,8 +349,6 @@ with c2:
     if up is not None:
         try:
             imp = pd.read_csv(up)
-            # Try best-effort mapping
-            # Accept either Duration (HH:MM:SS) or duration_s
             for _, row in imp.iterrows():
                 session_date = str(row.get("session_date") or row.get("date") or date.today())
                 sport = row.get("sport", "Run")
@@ -342,9 +361,23 @@ with c2:
                 rpe = row.get("rpe", None)
                 if pd.isna(rpe): rpe = None
                 notes = row.get("notes", None)
+                ath = row.get("athlete", selected_athlete)
+                if pd.isna(ath) or not str(ath).strip():
+                    ath = selected_athlete
 
-                insert_entry(conn, session_date, sport, session_type, distance_km, int(duration_s) if duration_s else None, int(rpe) if rpe else None, notes)
+                insert_entry(
+                    conn,
+                    athlete=str(ath),
+                    session_date=session_date,
+                    sport=sport,
+                    session_type=session_type,
+                    distance_km=float(distance_km) if distance_km is not None else None,
+                    duration_s=int(duration_s) if duration_s else None,
+                    rpe=int(rpe) if rpe else None,
+                    notes=notes,
+                )
             st.success("Import complete ✔️")
             st.rerun()
         except Exception as e:
             st.error(f"Import failed: {e}")
+
